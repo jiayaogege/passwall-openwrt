@@ -1,174 +1,173 @@
-#
-# Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
-# https://github.com/P3TERX/Actions-OpenWrt
-# Description: Build OpenWrt using GitHub Actions
-#
-
-name: OpenWrt Build for Newifi3
+name: OpenWrt Build System for Newifi3
 
 on:
-  # 触发机制配置
-  workflow_dispatch:    # 手动触发
+  # ======== 触发机制 ========
+  workflow_dispatch:    # 手动触发构建
     inputs:
-      debug_mode:
-        description: 'Enable SSH debug mode'
+      skip_cache:
+        description: 'Skip cache (clean build)'
         required: false
         default: 'false'
-  push:                 # 代码推送触发
-    branches: [ master ]
+  push:                 # 配置文件变更触发
+    branches: [ main ]
     paths: [ 'newifi3.config' ]
-  pull_request:         # PR触发测试
+  pull_request:         # PR验证触发
     paths: [ 'newifi3.config' ]
 
 env:
-  # 基础环境配置
-  REPO_URL: "https://github.com/Lienol/openwrt"   # OpenWrt 源
-  REPO_BRANCH: "19.07"                            # 指定稳定分支
-  TARGET_DEVICE: "d-team_newifi-d2"               # 设备代号（需验证）
-  BUILD_THREADS: "${{ github.runner.os == 'Linux' && '$(nproc)' || '2' }}" # 自动线程数
+  # ======== 核心参数 ========
+  REPO_URL: "https://github.com/Lienol/openwrt"  # 源仓库地址
+  REPO_BRANCH: "19.07"                          # 指定分支版本
+  TARGET_PROFILE: "d-team_newifi-d2"            # Newifi3设备代号
+  BUILD_THREADS: 8                              # 推荐8线程构建
 
 jobs:
-  build-firmware:
+  firmware-build:
     name: Build Newifi3 Firmware
-    runs-on: ubuntu-22.04      # 使用 LTS 版本
-    timeout-minutes: 120       # 超时保护
+    runs-on: ubuntu-22.04@github-2025           # 指定长期支持镜像
+    timeout-minutes: 150                        # 超时保护机制
 
     steps:
-    # ================= 初始化阶段 =================
-    - name: Checkout repository
-      uses: actions/checkout@v3
+    # ======== 阶段1：代码准备 ========
+    - name: Checkout config repo
+      uses: actions/checkout@v4
       with:
-        path: main-repo       # 独立路径防止冲突
-        fetch-depth: 0       # 获取完整提交历史
+        path: config-repo
+        fetch-depth: 0
 
-    # ================= 环境准备 =================
-    - name: Install build dependencies
+    # ======== 阶段2：环境初始化 ========
+    - name: Setup build environment
       run: |
-        # 基础编译依赖（基于 OpenWrt 官方文档）
-        sudo apt-get update -y
-        sudo apt-get install -y \
+        # 安装OpenWrt官方要求的依赖项
+        sudo apt-get update -qq
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
           build-essential clang flex bison g++ gawk gcc-multilib \
           gettext git libncurses-dev libssl-dev python3-distutils \
-          rsync unzip zlib1g-dev wget curl
+          rsync unzip zlib1g-dev file wget curl
 
-    # ================= 源码获取 =================
+    # ======== 阶段3：源码获取 ========
     - name: Clone OpenWrt source
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         repository: ${{ env.REPO_URL }}
         ref: ${{ env.REPO_BRANCH }}
-        path: openwrt-source
-        fetch-depth: 1       # 浅克隆加速
+        path: openwrt-src
+        fetch-depth: 1                          # 浅克隆加速
 
-    # ================= 配置注入 =================
+    # ======== 阶段4：配置注入 ========
     - name: Apply device configuration
       run: |
-        # 拷贝设备配置文件
-        cp main-repo/newifi3.config openwrt-source/.config
+        # 注入设备配置文件
+        cp config-repo/newifi3.config openwrt-src/.config
         
-        # 应用自定义补丁（如有）
-        if [ -f "main-repo/diy-patch.sh" ]; then
-          chmod +x main-repo/diy-patch.sh
-          ./main-repo/diy-patch.sh openwrt-source
+        # 应用自定义补丁（示例）
+        if [ -f "config-repo/patches/newifi3.patch" ]; then
+          git -C openwrt-src apply ../config-repo/patches/newifi3.patch
         fi
 
-    # ================= 缓存优化 =================
-    - name: Setup build cache
-      uses: actions/cache@v3
-      id: build-cache
+    # ======== 阶段5：缓存管理 ========
+    - name: Configure build cache
+      if: ${{ !inputs.skip_cache }}
+      uses: actions/cache@v4
       with:
         path: |
-          openwrt-source/dl         # 下载缓存
-          openwrt-source/staging_dir/host  # 编译缓存
-          openwrt-source/staging_dir/toolchain-*
-        key: ${{ runner.os }}-newifi3-${{ hashFiles('newifi3.config') }}-v3
+          openwrt-src/dl
+          openwrt-src/staging_dir/host
+          openwrt-src/staging_dir/toolchain-*
+        key: ${{ runner.os }}-newifi3-${{ hashFiles('newifi3.config') }}-v5
         restore-keys: |
           ${{ runner.os }}-newifi3-
 
-    # ================= 编译准备 =================
+    # ======== 阶段6：编译前准备 ========
     - name: Prepare build system
       run: |
-        cd openwrt-source
+        cd openwrt-src
         
-        # 验证配置文件有效性
+        # 验证配置有效性
         if ! make defconfig; then
-          echo "::error::Invalid config file detected!"
+          echo "::error file=newifi3.config::Invalid device configuration"
           exit 1
         fi
         
-        # 并行下载资源（自动失败重试）
-        for i in {1..3}; do
+        # 多线程下载重试机制
+        for attempt in {1..3}; do
           make -j${{ env.BUILD_THREADS }} download && break
-          sleep $((i*10))
+          echo "Download attempt $attempt failed, retrying..."
+          sleep $((attempt * 15))
         done
 
-    # ================= 固件编译 =================
+    # ======== 阶段7：核心编译 ========
     - name: Compile firmware
+      env:
+        FORCE_UNSAFE_CONFIGURE: 1               # 绕过某些包的安全限制
       run: |
-        cd openwrt-source
+        cd openwrt-src
         
-        # 编译过程优化参数
-        echo "FORCE_UNSAFE_CONFIGURE=1" >> $GITHUB_ENV  # 解决某些包的安全限制
-        
-        # 主编译流程（带错误重试）
+        # 主构建流程（带错误恢复）
         if ! make -j${{ env.BUILD_THREADS }} V=s; then
-          # 单线程重试关键部分
+          # 单线程重试关键组件
           make -j1 V=s tools/install
           make -j1 V=s toolchain/install
           make -j${{ env.BUILD_THREADS }} V=s
         fi
 
-    # ================= 产物处理 =================
-    - name: Collect artifacts
-      if: success()
+        # 验证固件生成
+        if [ ! -f bin/targets/ramips/mt7621/*.bin ]; then
+          echo "::error::No firmware files generated!"
+          exit 1
+        fi
+
+    # ======== 阶段8：产物处理 ========
+    - name: Package artifacts
       run: |
         # 创建标准化目录结构
-        mkdir -p firmware/${{ env.TARGET_DEVICE }}
+        mkdir -p artifacts/${{ env.TARGET_PROFILE }}
         
-        # 复制固件文件（匹配常见格式）
-        cp openwrt-source/bin/targets/ramips/mt7621/*.bin firmware/${{ env.TARGET_DEVICE }}/
+        # 复制固件文件（匹配MT7621平台）
+        cp openwrt-src/bin/targets/ramips/mt7621/*.bin artifacts/${{ env.TARGET_PROFILE }}/
         
-        # 生成 SHA256 校验
-        cd firmware/${{ env.TARGET_DEVICE }}
-        sha256sum *.bin > checksum.txt
+        # 生成校验文件
+        cd artifacts/${{ env.TARGET_PROFILE }}
+        sha256sum *.bin > sha256sums.txt
         
-        echo "ARTIFACT_PATH=$(pwd)/.." >> $GITHUB_ENV
+        # 设置环境变量供后续步骤使用
+        echo "ARTIFACT_DIR=$(pwd)" >> $GITHUB_ENV
 
-    # ================= 制品上传 =================
-    - name: Upload firmware
-      uses: actions/upload-artifact@v3
+    # ======== 阶段9：制品上传 ========
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
       with:
         name: newifi3-firmware-${{ github.run_id }}
-        path: ${{ env.ARTIFACT_PATH }}
+        path: |
+          ${{ env.ARTIFACT_DIR }}/*.bin
+          ${{ env.ARTIFACT_DIR }}/sha256sums.txt
         retention-days: 7
+        compression-level: 0        # 禁用压缩提升速度
 
-    # ================= 发布管理 =================
-    - name: Create GitHub Release
-      if: github.event_name == 'push' && success()
-      uses: softprops/action-gh-release@v1
+    # ======== 阶段10：版本发布 ========
+    - name: Publish release
+      if: github.event_name == 'push'
+      uses: softprops/action-gh-release@v2
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: "newifi3-${{ github.sha }}"     # 唯一标签
-        name: "Newifi3 Build ${{ github.run_id }}"
+        tag_name: "newifi3-$(date +%Y%m%d%H%M)"
+        name: "Newifi3 Build #${{ github.run_number }}"
         body: |
-          Auto-generated build for Newifi3 D2
-          - Commit: ${{ github.sha }}
-          - Build Date: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          ### OpenWrt Build Details
+          - **Core Version**: ${{ env.REPO_BRANCH }}
+          - **Build Date**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          - **Commit SHA**: ${{ github.sha }}
         files: |
-          ${{ env.ARTIFACT_PATH }}/*.bin
-          ${{ env.ARTIFACT_PATH }}/checksum.txt
+          ${{ env.ARTIFACT_DIR }}/*.bin
+          ${{ env.ARTIFACT_DIR }}/sha256sums.txt
 
-    # ================= 清理策略 =================
-    - name: Cleanup old artifacts
+    # ======== 阶段11：清理维护 ========
+    - name: Cleanup old releases
       if: always()
-      uses: dev-drprasad/delete-older-releases@v0.2.0
+      uses: dev-drprasad/delete-older-releases@v2
       with:
-        keep_latest: 5        # 保留最近5个版本
+        keep_latest: 5              # 保留最新5个版本
         delete_tag_pattern: "newifi3-*"
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
