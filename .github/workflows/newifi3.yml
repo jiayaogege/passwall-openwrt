@@ -1,173 +1,170 @@
-name: OpenWrt Build System for Newifi3
+name: OpenWrt Build for Newifi3 (D2)
 
 on:
-  # ======== 触发机制 ========
   workflow_dispatch:    # 手动触发构建
     inputs:
-      skip_cache:
-        description: 'Skip cache (clean build)'
+      clean_build:
+        description: 'Perform clean build (skip cache)'
         required: false
         default: 'false'
   push:                 # 配置文件变更触发
     branches: [ main ]
     paths: [ 'newifi3.config' ]
-  pull_request:         # PR验证触发
+  pull_request:         # PR触发验证
     paths: [ 'newifi3.config' ]
 
 env:
-  # ======== 核心参数 ========
-  REPO_URL: "https://github.com/Lienol/openwrt"  # 源仓库地址
-  REPO_BRANCH: "19.07"                          # 指定分支版本
-  TARGET_PROFILE: "d-team_newifi-d2"            # Newifi3设备代号
-  BUILD_THREADS: 8                              # 推荐8线程构建
+  # ===== 核心参数 =====
+  REPO_URL: "https://github.com/Lienol/openwrt"  # 经测试兼容的源码分支
+  REPO_BRANCH: "19.07"                          # 稳定版本分支
+  TARGET_DEVICE: "d-team_newifi-d2"              # 设备唯一标识符
+  BUILD_THREADS: 6                              # 推荐6线程构建
 
 jobs:
   firmware-build:
-    name: Build Newifi3 Firmware
-    runs-on: ubuntu-22.04                       # 指定长期支持镜像
-    timeout-minutes: 150                        # 超时保护机制
+    name: Newifi3-D2 Compilation
+    runs-on: ubuntu-22.04        # LTS版本环境
+    timeout-minutes: 130         # MT7621平台典型编译时间
 
     steps:
-    # ======== 阶段1：代码准备 ========
-    - name: Checkout config repo
+    # ===== 阶段1：代码检出 =====
+    - name: Checkout configuration
       uses: actions/checkout@v4
       with:
         path: config-repo
-        fetch-depth: 0
+        fetch-depth: 0           # 获取完整提交历史
 
-    # ======== 阶段2：环境初始化 ========
+    # ===== 阶段2：环境初始化 =====
     - name: Setup build environment
       run: |
-        # 安装OpenWrt官方要求的依赖项
+        # 安装OpenWrt官方编译依赖
         sudo apt-get update -qq
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
           build-essential clang flex bison g++ gawk gcc-multilib \
           gettext git libncurses-dev libssl-dev python3-distutils \
           rsync unzip zlib1g-dev file wget curl
 
-    # ======== 阶段3：源码获取 ========
+    # ===== 阶段3：源码获取 =====
     - name: Clone OpenWrt source
       uses: actions/checkout@v4
       with:
         repository: ${{ env.REPO_URL }}
         ref: ${{ env.REPO_BRANCH }}
         path: openwrt-src
-        fetch-depth: 1                          # 浅克隆加速
+        fetch-depth: 1           # 浅克隆优化速度
 
-    # ======== 阶段4：配置注入 ========
-    - name: Apply device configuration
+    # ===== 阶段4：配置注入 =====
+    - name: Apply device config
       run: |
         # 注入设备配置文件
         cp config-repo/newifi3.config openwrt-src/.config
         
-        # 应用自定义补丁（示例）
-        if [ -f "config-repo/patches/newifi3.patch" ]; then
-          git -C openwrt-src apply ../config-repo/patches/newifi3.patch
+        # 应用硬件补丁（示例）
+        if [ -f "config-repo/patches/mt7621.patch" ]; then
+          git -C openwrt-src apply ../config-repo/patches/mt7621.patch
         fi
 
-    # ======== 阶段5：缓存管理 ========
+    # ===== 阶段5：缓存管理 =====
     - name: Configure build cache
-      if: ${{ !inputs.skip_cache }}
+      if: ${{ !inputs.clean_build }}
       uses: actions/cache@v4
       with:
         path: |
-          openwrt-src/dl
-          openwrt-src/staging_dir/host
-          openwrt-src/staging_dir/toolchain-*
-        key: ${{ runner.os }}-newifi3-${{ hashFiles('newifi3.config') }}-v5
+          openwrt-src/dl         # 软件包缓存
+          openwrt-src/staging_dir/host  # 宿主工具链
+          openwrt-src/staging_dir/toolchain-*  # 交叉编译工具
+        key: ${{ runner.os }}-newifi3-${{ hashFiles('newifi3.config') }}-v4
         restore-keys: |
           ${{ runner.os }}-newifi3-
 
-    # ======== 阶段6：编译前准备 ========
+    # ===== 阶段6：编译准备 =====
     - name: Prepare build system
       run: |
         cd openwrt-src
         
-        # 验证配置有效性
+        # 验证配置文件有效性
         if ! make defconfig; then
-          echo "::error file=newifi3.config::Invalid device configuration"
+          echo "::error file=newifi3.config::设备配置文件错误！"
           exit 1
         fi
         
-        # 多线程下载重试机制
-        for attempt in {1..3}; do
+        # 智能重试下载机制
+        for retry in {1..3}; do
           make -j${{ env.BUILD_THREADS }} download && break
-          echo "Download attempt $attempt failed, retrying..."
-          sleep $((attempt * 15))
+          echo "下载失败，第$retry次重试..."
+          sleep $((retry * 20))
         done
 
-    # ======== 阶段7：核心编译 ========
+    # ===== 阶段7：核心编译 =====
     - name: Compile firmware
       env:
-        FORCE_UNSAFE_CONFIGURE: 1               # 绕过某些包的安全限制
+        FORCE_UNSAFE_CONFIGURE: 1    # 绕过某些包的安全限制
       run: |
         cd openwrt-src
         
-        # 主构建流程（带错误恢复）
+        # 主编译流程（带错误恢复）
         if ! make -j${{ env.BUILD_THREADS }} V=s; then
           # 单线程重试关键组件
+          echo "::warning::主编译失败，尝试单线程修复..."
           make -j1 V=s tools/install
           make -j1 V=s toolchain/install
           make -j${{ env.BUILD_THREADS }} V=s
         fi
 
-        # 验证固件生成
+        # 固件存在性验证
         if [ ! -f bin/targets/ramips/mt7621/*.bin ]; then
-          echo "::error::No firmware files generated!"
+          echo "::error::未生成固件文件！"
           exit 1
         fi
 
-    # ======== 阶段8：产物处理 ========
+    # ===== 阶段8：产物处理 =====
     - name: Package artifacts
       run: |
-        # 创建标准化目录结构
-        mkdir -p artifacts/${{ env.TARGET_PROFILE }}
+        # 创建标准化输出目录
+        mkdir -p artifacts/${{ env.TARGET_DEVICE }}
         
-        # 复制固件文件（匹配MT7621平台）
-        cp openwrt-src/bin/targets/ramips/mt7621/*.bin artifacts/${{ env.TARGET_PROFILE }}/
+        # 复制MT7621平台固件
+        cp openwrt-src/bin/targets/ramips/mt7621/*.bin artifacts/${{ env.TARGET_DEVICE }}/
         
         # 生成校验文件
-        cd artifacts/${{ env.TARGET_PROFILE }}
-        sha256sum *.bin > sha256sums.txt
+        cd artifacts/${{ env.TARGET_DEVICE }}
+        sha256sum *.bin > sha256sum.txt
         
-        # 设置环境变量供后续步骤使用
-        echo "ARTIFACT_DIR=$(pwd)" >> $GITHUB_ENV
+        # 设置环境变量供后续使用
+        echo "ARTIFACT_PATH=$(pwd)" >> $GITHUB_ENV
 
-    # ======== 阶段9：制品上传 ========
-    - name: Upload build artifacts
+    # ===== 阶段9：制品上传 =====
+    - name: Upload firmware
       uses: actions/upload-artifact@v4
       with:
         name: newifi3-firmware-${{ github.run_id }}
-        path: |
-          ${{ env.ARTIFACT_DIR }}/*.bin
-          ${{ env.ARTIFACT_DIR }}/sha256sums.txt
+        path: ${{ env.ARTIFACT_PATH }}
         retention-days: 7
-        compression-level: 0        # 禁用压缩提升速度
+        compression-level: 0    # 禁用压缩提升速度
 
-    # ======== 阶段10：版本发布 ========
-    - name: Publish release
+    # ===== 阶段10：版本发布 =====
+    - name: Create GitHub Release
       if: github.event_name == 'push'
       uses: softprops/action-gh-release@v2
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: "newifi3-$(date +%Y%m%d%H%M)"
-        name: "Newifi3 Build #${{ github.run_number }}"
+        tag_name: "newifi3-${{ github.sha }}"  # 唯一标签
+        name: "Newifi3 Build ${{ github.run_number }}"
         body: |
-          ### OpenWrt Build Details
-          - **Core Version**: ${{ env.REPO_BRANCH }}
-          - **Build Date**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          - **Commit SHA**: ${{ github.sha }}
+          ### 编译信息
+          - **设备型号**: ${{ env.TARGET_DEVICE }}
+          - **源码分支**: ${{ env.REPO_BRANCH }}
+          - **编译时间**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
         files: |
-          ${{ env.ARTIFACT_DIR }}/*.bin
-          ${{ env.ARTIFACT_DIR }}/sha256sums.txt
+          ${{ env.ARTIFACT_PATH }}/*.bin
+          ${{ env.ARTIFACT_PATH }}/sha256sum.txt
 
-    # ======== 阶段11：清理维护 ========
+    # ===== 阶段11：清理维护 =====
     - name: Cleanup old releases
-      if: always()
-      uses: dev-drprasad/delete-older-releases@v2
+      uses: dev-drprasad/delete-older-releases@v0.2.0
       with:
-        keep_latest: 5              # 保留最新5个版本
+        keep_latest: 5          # 保留最新5个版本
         delete_tag_pattern: "newifi3-*"
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
